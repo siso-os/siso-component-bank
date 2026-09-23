@@ -32,7 +32,7 @@ node registry/curated/query.mjs --presets                       # operator, mode
 ```
 Curated rows carry `shaan_said`, `signal`, `vote`, `winner_of_type`; scout rows carry `bank_score`, `why`,
 `ab_against`. Both carry local `preview`/`bundle`/`source` paths. A ★ or ✓ outranks any score.
-Project pointer for the operator: `SISO_Workspace/_archive/2026-09-23-home-cleanup/home-SISO_Agency-stray/apps/oracle-operator/docs/UI-BANK.md`.
+Project pointer for the operator: `SISO_Agency/apps/oracle-operator/docs/UI-BANK.md`.
 Read `feedback` before choosing; it says what he liked about it. Then read `bundle.html` or
 `code.tsx` from the store pointers in the row. Adapt to the tenant DNA, never paste.
 
