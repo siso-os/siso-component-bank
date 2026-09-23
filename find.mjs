@@ -1,114 +1,177 @@
 #!/usr/bin/env node
-// The agent-facing query surface over the harvested corpus.
+// find.mjs — the agent-facing query surface over this component bank.
 //
-// An agent asked to "build a pricing page" should not grep 7,949 folders or
-// pull a 700KB catalogue into its context. It runs one command, gets back a
-// handful of ranked candidates with local preview paths, and looks at those.
+// Reads index.jsonl (one JSON object per line; the 5 Sep release replaced
+// classification.json + harvest/ with it) and streams it line by line, scoring
+// every record against the query words. An agent asked to "build a pricing
+// page" gets a handful of ranked candidates with preview paths instead of
+// grepping 8,539 folders or loading the whole catalogue into context.
 //
-//   node find.mjs pricing                     # by tag or free text
-//   node find.mjs hero --limit 5
-//   node find.mjs card --tag testimonials     # intersect two tags
-//   node find.mjs --tags                      # list the 75-tag vocabulary
-//   node find.mjs pricing --json              # machine-readable for agents
+//   node find.mjs pricing                        # free text; default --limit 12
+//   node find.mjs "testimonial card" --limit 3
+//   node find.mjs card --category pricing        # --tag is an alias
+//   node find.mjs hero --source-only             # only records with code.tsx
+//   node find.mjs --categories                   # category vocabulary (--tags)
+//   node find.mjs pricing --json                 # machine-readable, abs paths
 //
-// Ranking: classification confidence (page > api > local) dominates, damped by
-// how many tags a component carries, with usage_count (real installs) breaking
-// ties. Installs alone are misleading — a 2,000-install shadcn primitive that
-// the semantic search loosely tagged will otherwise outrank a purpose-built
-// component that is exactly what was asked for.
+// Scoring per record: +3 per query word found in name or slug, +3 per word
+// found in a structured classification tag (category, subcategory, visual_style,
+// interactions, best_for_industries, platform_fit, complexity; prose keys such
+// as ai_summary/use_cases and _-prefixed metadata are not tags), +1 per word
+// found in the description. Records scoring 0 are dropped. Then
+// +log10(usage_count + 1) and +1 when the source is actually retrievable.
+// Sort: score desc, then usage_count desc. No dependencies beyond Node's stdlib.
 
-import { readFile, readdir } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { createReadStream } from 'node:fs'
+import { createInterface } from 'node:readline'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+const INDEX = join(HERE, 'index.jsonl')
+
 const args = process.argv.slice(2)
-const flag = (n, d) => args.includes(n) ? args[args.indexOf(n) + 1] : d
+const flagValue = n => (args.includes(n) ? args[args.indexOf(n) + 1] : null)
+
 const JSON_OUT = args.includes('--json')
-const LIMIT = Number(flag('--limit', 12))
-const ALSO = flag('--tag', null)
-const query = args.filter(a => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--limit' && args[args.indexOf(a) - 1] !== '--tag').join(' ').trim()
+const LIST_CATS = args.includes('--categories') || args.includes('--tags')
+const SOURCE_ONLY = args.includes('--source-only')
+const CATEGORY = flagValue('--category') ?? flagValue('--tag')
 
-const cls = JSON.parse(await readFile(join(HERE, 'classification.json'), 'utf8'))
+const limitRaw = flagValue('--limit')
+const limitNum = Number(limitRaw)
+const LIMIT = Number.isFinite(limitNum) && limitNum >= 1 ? Math.floor(limitNum) : 12
 
-if (args.includes('--tags')) {
-  const counts = cls.tagCounts
-  for (const t of cls.taxonomy) console.log(String(counts[t] ?? 0).padStart(5), t)
-  process.exit(0)
+const VALUE_FLAGS = new Set(['--limit', '--category', '--tag'])
+const words = []
+for (let i = 0; i < args.length; i++) {
+  if (VALUE_FLAGS.has(args[i])) { i++; continue }
+  if (args[i].startsWith('--')) continue
+  words.push(args[i])
 }
-if (!query) { console.error('usage: node find.mjs <tag|text> [--tag other] [--limit n] [--json]'); process.exit(1) }
+const query = words.join(' ').trim()
 
-// load harvested metadata
-const meta = new Map()
-for (const d of (await readdir(join(HERE, 'harvest'))).filter(x => x.includes('__'))) {
-  try {
-    const m = JSON.parse(await readFile(join(HERE, 'harvest', d, 'meta.json'), 'utf8'))
-    meta.set(m.url, { ...m, dir: d })
-  } catch {}
+if (!query && !LIST_CATS) {
+  console.error('usage: node find.mjs <text> [--limit N] [--category C] [--json] [--source-only]')
+  console.error('       node find.mjs --categories          # alias: --tags')
+  process.exit(1)
 }
 
-const RANK = { page: 3, api: 2, local: 1 }
-const norm = s => s.toLowerCase().replace(/[-_\s]+/g, ' ').trim()
-const q = norm(query)
+const norm = s => String(s).toLowerCase().replace(/[-_\s]+/g, ' ').trim()
+const asList = v => (Array.isArray(v) ? v : v == null ? [] : [v]).filter(x => typeof x === 'string' && x.trim())
 
-// exact tag match if the query names one, else free-text over slug/name/description
-const isTag = cls.taxonomy.includes(query) || cls.taxonomy.includes(q.replace(/ /g, '-'))
-const tagName = isTag ? (cls.taxonomy.includes(query) ? query : q.replace(/ /g, '-')) : null
-
-const rows = []
-for (const [url, tags] of Object.entries(cls.componentToTags)) {
-  const m = meta.get(url)
-  if (!m) continue
-  const names = tags.map(t => t.tag)
-  if (ALSO && !names.includes(ALSO)) continue
-
-  let hit = false, conf = 0
-  if (tagName) {
-    const t = tags.find(x => x.tag === tagName)
-    if (t) { hit = true; conf = RANK[t.source] ?? 1 }
-  } else {
-    const hay = norm(`${m.slug} ${m.name || ''} ${m.description || ''}`)
-    if (hay.includes(q)) { hit = true; conf = names.length ? 2 : 1 }
+const PROSE_KEYS = new Set(['ai_summary', 'use_cases'])
+function tagsOf(c) {
+  const out = []
+  for (const [k, v] of Object.entries(c ?? {})) {
+    if (k.startsWith('_') || PROSE_KEYS.has(k)) continue
+    out.push(...asList(v))
   }
-  if (!hit) continue
+  return out
+}
+const catsOf = c => asList(c?.category)
+const subOf = c => asList(c?.subcategory).join(', ')
 
-  rows.push({
-    id: m.id,
-    name: m.name,
-    author: m.author,
-    slug: m.slug,
-    description: (m.description || '').slice(0, 140),
-    tags: names,
-    installs: m.usage_count ?? null,
-    confidence: conf,
-    url,
-    preview: join('registry/21st/harvest', m.dir, m.preview || 'preview.webp'),
-    bundle: join('registry/21st/harvest', m.dir, 'bundle.html'),
-    install: m.installCommand,
+const terms = [...new Set(norm(query).split(' ').filter(Boolean))]
+const wanted = CATEGORY ? norm(CATEGORY) : null
+
+// 1,002 records set has_source: true while carrying no source path at all, so
+// the flag alone would let --source-only return hits that print "no source".
+// Effective has_source means the code is actually retrievable.
+const hasSource = rec => rec.has_source === true && typeof rec.source === 'string' && rec.source.trim() !== ''
+
+const baseScore = rec => {
+  const nameSlug = norm(rec.name ?? '') + ' ' + norm(rec.slug ?? '')
+  const tags = tagsOf(rec.classification).map(norm)
+  const desc = norm(rec.description ?? '')
+  let s = 0
+  for (const t of terms) {
+    if (nameSlug.includes(t)) s += 3
+    if (tags.some(tag => tag.includes(t))) s += 3
+    if (desc.includes(t)) s += 1
+  }
+  return s
+}
+
+const hits = []
+const catCounts = new Map()
+let skipped = 0
+
+const rl = createInterface({ input: createReadStream(INDEX, 'utf8'), crlfDelay: Infinity })
+for await (const line of rl) {
+  const raw = line.trim()
+  if (!raw) continue
+  let rec
+  try { rec = JSON.parse(raw) } catch { skipped++; continue }
+
+  const cats = catsOf(rec.classification)
+
+  if (LIST_CATS) {
+    for (const c of cats) {
+      const k = norm(c)
+      const seen = catCounts.get(k)
+      if (seen) seen.count++
+      else catCounts.set(k, { label: c, count: 1 })
+    }
+    continue
+  }
+
+  if (wanted && !cats.some(c => norm(c) === wanted)) continue
+  if (SOURCE_ONLY && !hasSource(rec)) continue
+
+  const base = baseScore(rec)
+  if (base === 0) continue
+
+  const usage = Number(rec.usage_count) || 0
+  hits.push({
+    rec,
+    cats,
+    sub: subOf(rec.classification),
+    usage,
+    score: base + Math.log10(usage + 1) + (hasSource(rec) ? 1 : 0),
   })
 }
 
-// Rank on confidence FIRST, then popularity. Sorting by installs alone put
-// originui/calendar top of "pricing-section": the semantic API had loosely
-// tagged it, and 2,028 installs then buried genuinely-relevant results.
-// A component carrying many tags is also a weaker signal for any one of them —
-// originui/dialog holds 27 — so spread damps the score.
-const score = r => {
-  const spread = 1 / Math.sqrt(Math.max(1, r.tags.length))
-  return r.confidence * 1000 * spread + Math.log10(1 + (r.installs ?? 0))
+if (skipped) console.error(`warning: skipped ${skipped} unparseable line(s) in index.jsonl`)
+
+if (LIST_CATS) {
+  const order = [...catCounts.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+  for (const { label, count } of order) console.log(`${count}  ${label}`)
+  process.exit(0)
 }
-rows.sort((a, b) => score(b) - score(a))
-const out = rows.slice(0, LIMIT)
+
+hits.sort((a, b) =>
+  b.score - a.score ||
+  b.usage - a.usage ||
+  String(a.rec.id).localeCompare(String(b.rec.id))
+)
+const out = hits.slice(0, LIMIT)
+
+const abs = p => (p ? (isAbsolute(p) ? p : join(HERE, p)) : null)
 
 if (JSON_OUT) {
-  console.log(JSON.stringify({ query, matched: rows.length, returned: out.length, results: out }, null, 2))
-} else {
-  console.log(`${rows.length} match "${query}"${ALSO ? ` + ${ALSO}` : ''} — top ${out.length}\n`)
-  for (const r of out) {
-    console.log(`${r.installs != null ? String(r.installs).padStart(6) : '     ·'}  ${r.author}/${r.slug}`)
-    console.log(`        ${r.description || '(no description)'}`)
-    console.log(`        tags: ${r.tags.join(', ')}`)
-    console.log(`        ${r.preview}`)
-    console.log()
-  }
+  console.log(JSON.stringify(out.map(({ rec, cats, sub, usage, score }) => ({
+    id: rec.id,
+    name: rec.name,
+    url: rec.url,
+    description: rec.description,
+    category: cats,
+    subcategory: sub,
+    usage_count: usage,
+    source: abs(rec.source),
+    preview: abs(rec.preview),
+    score: Math.round(score * 1000) / 1000,
+  })), null, 2))
+  process.exit(0)
+}
+
+if (!out.length) {
+  console.log(`no matches for ${query}`)
+  process.exit(0)
+}
+
+for (const { rec, cats, sub, usage } of out) {
+  const label = [cats.join(', ') || 'unclassified', sub].filter(Boolean).join('/')
+  console.log(`${rec.id}  ${label}  ${usage} installs  ${rec.source || 'no source'}`)
+  console.log(`  ${rec.preview || 'no preview'}`)
 }
