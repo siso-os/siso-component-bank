@@ -10,7 +10,7 @@
 | Run it | no entry point declared; see `README.md` |
 | Write here | `.agents/memory/MEMORY.md` (durable facts, one file each plus an index line) |
 | Worktrees | _data/worktrees/siso-component-bank/&lt;lane&gt; (never beside or inside the repo) |
-| Find anything | `estate where <words>`; the city map is `estate map` |
+| Anything outside this repo | ask the estate first, not this repo's docs: `estate where <words>` (a sentence works), the map is `~/SISO_Workspace/AGENTS.md`; loose files go to `~/SISO_Workspace/_inbox`, data backups are declared in `SISO_Agents/siso-estate/plan/data-planes.json` |
 <!-- estate:door end -->
 
 The rest is in `README.md`. Find anything else on this machine with `estate where <words>`.
